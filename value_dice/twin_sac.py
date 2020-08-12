@@ -46,6 +46,37 @@ def soft_update(net, target_net, tau=0.005):
     new_value = var * tau + target_var * (1 - tau)
     target_var.assign(new_value)
 
+class InverseModel(tf.keras.Model):
+    """ Infer actions given observation transitions: a ~ Inv(s,s')"""
+
+    def __init__(self, state_dim, action_dim):
+        super(InverseModel, self).__init__()
+        self.inverse_model=tf.keras.Sequential([
+            tf.keras.layers.Dense(
+                256,
+                input_shape=(state_dim * 2,),
+                activation=tf.nn.relu,
+                kernel_initializer='orthogonal'),
+            tf.keras.layers.Dense(
+                256, activation=tf.nn.relu, kernel_initializer='orthogonal'),
+            tf.keras.layers.Dense(action_dim, kernel_initializer='orthogonal')
+        ])
+
+        @tf.function
+        def call(self, states, next_states):
+            """Returns Q-value estimates for given states and actions.
+
+            Args:
+              states: A batch of states.
+              next_states: A batch of next states
+            Returns:
+              Two estimates of Q-values.
+            """
+            transition=tf.concat([states, next_states], -1)
+            acs=self.inverse_model(transition)
+            return acs
+
+
 
 class Actor(tf.keras.Model):
   """Gaussian policy with TanH squashing."""
@@ -189,6 +220,7 @@ class SAC(object):
                log_interval,
                actor_lr=1e-3,
                critic_lr=1e-3,
+               inverse_lr=1e-3,
                alpha_init=1.0,
                learn_alpha=True,
                rewards_fn=lambda s, a, r: r):
@@ -219,6 +251,11 @@ class SAC(object):
     self.avg_critic_loss = tf.keras.metrics.Mean(
         'critic_loss', dtype=tf.float32)
 
+    self.inverse = InverseModel(state_dim, action_dim)
+    self.inverse_optimizer = tf.keras.optimizers.Adam(learning_rate=inverse_lr)
+    self.avg_inverse_loss = tf.keras.metrics.Mean('inverse_loss', dtype=tf.float32)
+
+
     self.log_alpha = tf.Variable(tf.math.log(alpha_init), trainable=True)
     self.learn_alpha = learn_alpha
     self.alpha_optimizer = tf.keras.optimizers.Adam()
@@ -229,6 +266,27 @@ class SAC(object):
   @property
   def alpha(self):
     return tf.exp(self.log_alpha)
+
+
+  def fit_inverse(self, states, actions, next_states):
+      """
+      Update inverse action model.
+      Returns:
+          Inverse loss.
+      """
+      with tf.GradientTape(watch_accessed_variables=False) as tape:
+          tape.watch(self.inverse.variables)
+          inverse_actions=self.inverse(states, next_states)
+          inverse_loss = tf.reduce_mean(tf.losses.mean_squared_error(actions, inverse_actions))
+          inverse_loss += keras_utils.orthogonal_regularization(self.inverse.inverse_model)
+
+      inverse_grads = tape.gradient(inverse_loss, self.inverse.variables)
+
+      self.inverse_optimizer.apply_gradients(
+          zip(inverse_grads, self.inverse.variables))
+
+      return inverse_loss
+
 
   def fit_critic(self, states, actions, next_states, rewards, masks, discount):
     """Updates critic parameters.
@@ -266,15 +324,49 @@ class SAC(object):
 
     return critic_loss
 
+  def fit_actor_lfo(self, states, expert_states, expert_next_states, target_entropy):
+    is_non_absorbing_mask=tf.cast(tf.equal(states[:, -1:], 0.0), tf.float32)
+
+    with tf.GradientTape(watch_accessed_variables=False) as tape:
+        tape.watch(self.actor.variables)
+        _, actions, log_probs=self.actor(states)
+        q1, q2=self.critic(states, actions)
+        q=tf.minimum(q1, q2)
+        actor_loss=tf.reduce_sum(is_non_absorbing_mask *
+                                 (self.alpha * log_probs - q)) / (
+                           tf.reduce_sum(is_non_absorbing_mask) + EPS)
+
+        actor_loss+=keras_utils.orthogonal_regularization(self.actor.trunk)
+        expert_inverse_acs = self.inveres(expert_states, expert_next_states)
+        expert_predict_acs = self.actor(expert_states)
+        inverse_loss = tf.reduce_mean(tf.losses.mean_squared_error(expert_inverse_acs, expert_predict_acs))
+        actor_loss += 0.1 * inverse_loss
+
+
+    actor_grads=tape.gradient(actor_loss, self.actor.variables)
+    self.actor_optimizer.apply_gradients(zip(actor_grads, self.actor.variables))
+
+    with tf.GradientTape(watch_accessed_variables=False) as tape:
+        tape.watch([self.log_alpha])
+        alpha_loss=tf.reduce_sum(is_non_absorbing_mask * self.alpha *
+                                 (-log_probs - target_entropy)) / (
+                           tf.reduce_sum(is_non_absorbing_mask) + EPS)
+
+    if self.learn_alpha:
+        alpha_grads=tape.gradient(alpha_loss, [self.log_alpha])
+        self.alpha_optimizer.apply_gradients(zip(alpha_grads, [self.log_alpha]))
+
+    return actor_loss, inverse_loss, alpha_loss, -log_probs
+
   def fit_actor(self, states, target_entropy):
     """Updates actor parameters.
 
-    Args:
-      states: A batch of states.
-      target_entropy: Target entropy value for alpha.
+      Args:
+        states: A batch of states.
+        target_entropy: Target entropy value for alpha.
 
-    Returns:
-      Actor and alpha losses.
+      Returns:
+        Actor and alpha losses.
     """
     is_non_absorbing_mask = tf.cast(tf.equal(states[:, -1:], 0.0), tf.float32)
 
@@ -303,6 +395,76 @@ class SAC(object):
       self.alpha_optimizer.apply_gradients(zip(alpha_grads, [self.log_alpha]))
 
     return actor_loss, alpha_loss, -log_probs
+
+  @tf.function
+  def train_lfo(self,
+            expert_dataset_iter,
+            replay_buffer_iter,
+            discount=0.99,
+            tau=0.005,
+            target_entropy=0,
+            actor_update_freq=2):
+      """Performs a single training step for inverse, critic, and actor.
+
+      Args:
+        expert_dataset_iter: An tensorflow graph iteratable object.
+        replay_buffer_iter: An tensorflow graph iteratable object.
+        discount: A discount used to compute returns.
+        tau: A soft updates discount.
+        target_entropy: A target entropy for alpha.
+        actor_update_freq: A frequency of the actor network updates.
+
+      Returns:
+        Actor and alpha losses.
+      """
+      states, actions, next_states, rewards, masks = next(replay_buffer_iter)[0]
+      expert_states, _, expert_next_states = next(expert_dataset_iter)
+
+      rewards = self.rewards_fn(states, actions, rewards)
+
+      critic_loss = self.fit_critic(states, actions, next_states, rewards, masks,
+                                    discount)
+
+      self.avg_critic_loss(critic_loss)
+      if tf.equal(self.critic_optimizer.iterations % self.log_interval, 0):
+          tf.summary.scalar(
+              'train sac/critic_loss',
+              self.avg_critic_loss.result(),
+              step=self.critic_optimizer.iterations)
+          keras_utils.my_reset_states(self.avg_critic_loss)
+
+      if tf.equal(self.critic_optimizer.iterations % actor_update_freq, 0):
+          actor_loss, alpha_loss, entropy = self.fit_actor(states, target_entropy)
+          soft_update(self.critic, self.critic_target, tau=tau)
+
+          self.avg_actor_loss(actor_loss)
+          self.avg_alpha_loss(alpha_loss)
+          self.avg_actor_entropy(entropy)
+          self.avg_alpha(self.alpha)
+          if tf.equal(self.actor_optimizer.iterations % self.log_interval, 0):
+              tf.summary.scalar(
+                  'train sac/actor_loss',
+                  self.avg_actor_loss.result(),
+                  step=self.actor_optimizer.iterations)
+              keras_utils.my_reset_states(self.avg_actor_loss)
+
+              tf.summary.scalar(
+                  'train sac/alpha_loss',
+                  self.avg_alpha_loss.result(),
+                  step=self.actor_optimizer.iterations)
+              keras_utils.my_reset_states(self.avg_alpha_loss)
+
+              tf.summary.scalar(
+                  'train sac/actor entropy',
+                  self.avg_actor_entropy.result(),
+                  step=self.actor_optimizer.iterations)
+              keras_utils.my_reset_states(self.avg_actor_entropy)
+
+              tf.summary.scalar(
+                  'train sac/alpha',
+                  self.avg_alpha.result(),
+                  step=self.actor_optimizer.iterations)
+              keras_utils.my_reset_states(self.avg_alpha)
 
   @tf.function
   def train_bc(self, expert_dataset_iter):

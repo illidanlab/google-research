@@ -29,8 +29,10 @@ def load_expert_data(filename):
     Numpy arrays that contain states, actions, next_states and dones
   """
   with open(filename, 'rb') as fin:
-    expert_data = np.load(fin)
+    expert_data = np.load(fin, allow_pickle=True)
     expert_data = {key: expert_data[key] for key in expert_data.files}
+    for key in expert_data:
+      print(expert_data[key].shape)
 
     expert_states = expert_data['states']
     expert_actions = expert_data['actions']

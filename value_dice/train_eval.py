@@ -33,13 +33,16 @@ from value_dice import data_utils
 from value_dice import gail
 from value_dice import twin_sac
 from value_dice import value_dice
+from value_dice import value_dicefo
 from value_dice import wrappers
+import csv
+import json
 
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string('env_name', 'HalfCheetah-v2',
                     'Environment for training/evaluation.')
-flags.DEFINE_integer('seed', 42, 'Fixed random seed for training.')
+flags.DEFINE_integer('seed', 1, 'Fixed random seed for training.')
 flags.DEFINE_integer('sample_batch_size', 256, 'Batch size.')
 flags.DEFINE_integer('actor_update_freq', 1, 'Update actor every N steps.')
 flags.DEFINE_float('discount', 0.99, 'Discount used for returns.')
@@ -51,8 +54,8 @@ flags.DEFINE_float('sac_alpha', 0.1, 'SAC temperature.')
 flags.DEFINE_float('tau', 0.005,
                    'Soft update coefficient for the target network.')
 flags.DEFINE_integer('hidden_size', 256, 'Hidden size.')
-flags.DEFINE_integer('updates_per_step', 5, 'Updates per time step.')
-flags.DEFINE_integer('max_timesteps', int(1e5), 'Max timesteps to train.')
+flags.DEFINE_integer('updates_per_step', 1, 'Updates per time step.')
+flags.DEFINE_integer('max_timesteps', int(1e6), 'Max timesteps to train.')
 flags.DEFINE_integer('num_trajectories', 1, 'Number of trajectories to use.')
 flags.DEFINE_integer('num_random_actions', int(2e3),
                      'Fill replay buffer with N random actions.')
@@ -60,13 +63,14 @@ flags.DEFINE_integer('start_training_timesteps', int(1e3),
                      'Start training when replay buffer contains N timesteps.')
 flags.DEFINE_string('expert_dir', None, 'Directory to load expert demos.')
 flags.DEFINE_string('save_dir', None, 'Directory to save results to.')
+flags.DEFINE_string('task', "valuedice", 'Task Name.')
 flags.DEFINE_boolean('learn_alpha', True,
                      'Whether to learn temperature for SAC.')
 flags.DEFINE_boolean('normalize_states', True,
                      'Normalize states using expert stats.')
 flags.DEFINE_integer('log_interval', int(1e3), 'Log every N timesteps.')
 flags.DEFINE_integer('eval_interval', int(1e3), 'Evaluate every N timesteps.')
-flags.DEFINE_enum('algo', 'value_dice', ['bc', 'dac', 'value_dice'],
+flags.DEFINE_enum('algo', 'value_dice', ['bc', 'dac', 'value_dice', 'value_dicefo', 'eval'],
                   'Algorithm to use to compute occupancy ration.')
 flags.DEFINE_integer('absorbing_per_episode', 10,
                      'A number of absorbing states per episode to add.')
@@ -234,12 +238,27 @@ def main(_):
 
   log_dir = os.path.join(FLAGS.save_dir, 'logs')
   log_filename = os.path.join(log_dir, hparam_str)
+  path_prefix = '/mnt/research-share/projects/zhuzhuan/baselines'
+  path_prefix = '/mnt/research/illidan/judy/baselines'
+  csv_log_dir = os.path.join(path_prefix,'{}/valuedice'.format(FLAGS.task), FLAGS.env_name, 'rank{}'.format(FLAGS.seed) )
+  csv_filename = os.path.join(csv_log_dir, 'agent0.monitor.csv')
+  if not os.path.exists(csv_log_dir):
+      os.makedirs(csv_log_dir)
   if not os.path.exists(log_dir):
     os.makedirs(log_dir)
 
   if 'dac' in FLAGS.algo:
     imitator = gail.RatioGANGP(env.observation_space.shape[0],
                                env.action_space.shape[0], FLAGS.log_interval)
+  elif 'value_dicefo' in FLAGS.algo:
+    imitator=value_dicefo.ValueDICEfO(
+        env.observation_space.shape[0],
+        env.action_space.shape[0],
+        nu_lr=FLAGS.nu_lr,
+        actor_lr=FLAGS.actor_lr,
+        alpha_init=FLAGS.sac_alpha,
+        hidden_size=FLAGS.hidden_size,
+        log_interval=FLAGS.log_interval)
   elif 'value_dice' in FLAGS.algo:
     imitator = value_dice.ValueDICE(
         env.observation_space.shape[0],
@@ -272,6 +291,12 @@ def main(_):
 
   total_timesteps = 0
   previous_time = time.time()
+  # write to logger file
+  file_handler = open(csv_filename, 'wt')
+  file_handler.write('#%s\n' % json.dumps({"t_start": "0", 'env_id': FLAGS.env_name}))
+  logger = csv.DictWriter(file_handler, fieldnames=('r', 'l', 't') )
+  logger.writeheader()
+  file_handler.flush()
 
   eval_returns = []
   with tqdm(total=FLAGS.max_timesteps, desc='') as pbar:
@@ -280,10 +305,16 @@ def main(_):
 
       if total_timesteps % FLAGS.eval_interval == 0:
         logging.info('Performing policy eval.')
-        average_returns, evaluation_timesteps = evaluate(sac.actor, eval_env)
+        average_returns, evaluation_timesteps = evaluate(sac.actor, eval_env, num_episodes=5)
 
-        eval_returns.append(average_returns)
-        np.save(log_filename, np.array(eval_returns))
+        #eval_returns.append([average_returns])#, evaluation_timesteps, -1])
+        #np.save(log_filename, np.array(eval_returns))
+
+        # write to logger file
+        ep_info={"r": round(average_returns, 6), "l": evaluation_timesteps, "t": 0}
+        logger.writerow(ep_info)
+        file_handler.flush()
+        #print("..... file saved to {}".format(csv_filename))
 
         with summary_writer.as_default():
           tf.summary.scalar(
@@ -336,7 +367,6 @@ def main(_):
       # buffer to maintain the same interface. Also always use a zero mask
       # since we need to always bootstrap for imitation learning.
       add_samples_to_replay_buffer(replay_buffer, obs, action, next_obs)
-
       add_samples_to_replay_buffer(policy_replay_buffer, obs, action, next_obs)
       if done and not truncated_done:
         # Add several absobrsing states to absorbing states transitions.
@@ -378,6 +408,15 @@ def main(_):
                   tau=FLAGS.tau,
                   target_entropy=-env.action_space.shape[0],
                   actor_update_freq=FLAGS.actor_update_freq)
+    file_handler.close()
+    if 'value_dice' in FLAGS.algo:
+      for _ in range(50):
+          average_returns, evaluation_timesteps=evaluate(sac.actor, eval_env, num_episodes=1)
+          eval_returns.append([average_returns])  # , evaluation_timesteps, -1])
+      np.save(os.path.join(csv_log_dir, 'final') , np.array(eval_returns))
+    if 'eval' in FLAGS.algo:
+        data = np.load("{}.npy".format(os.path.join(csv_log_dir, 'final')))
+        print(data)
 
 
 if __name__ == '__main__':
